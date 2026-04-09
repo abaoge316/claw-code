@@ -38,6 +38,7 @@ pub enum ProviderKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderMetadata {
     pub provider: ProviderKind,
+    pub provider_name: &'static str,
     pub auth_env: &'static str,
     pub base_url_env: &'static str,
     pub default_base_url: &'static str,
@@ -54,6 +55,7 @@ const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
         "opus",
         ProviderMetadata {
             provider: ProviderKind::Anthropic,
+            provider_name: "Anthropic",
             auth_env: "ANTHROPIC_API_KEY",
             base_url_env: "ANTHROPIC_BASE_URL",
             default_base_url: anthropic::DEFAULT_BASE_URL,
@@ -63,6 +65,7 @@ const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
         "sonnet",
         ProviderMetadata {
             provider: ProviderKind::Anthropic,
+            provider_name: "Anthropic",
             auth_env: "ANTHROPIC_API_KEY",
             base_url_env: "ANTHROPIC_BASE_URL",
             default_base_url: anthropic::DEFAULT_BASE_URL,
@@ -72,6 +75,7 @@ const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
         "haiku",
         ProviderMetadata {
             provider: ProviderKind::Anthropic,
+            provider_name: "Anthropic",
             auth_env: "ANTHROPIC_API_KEY",
             base_url_env: "ANTHROPIC_BASE_URL",
             default_base_url: anthropic::DEFAULT_BASE_URL,
@@ -81,6 +85,7 @@ const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
         "grok",
         ProviderMetadata {
             provider: ProviderKind::Xai,
+            provider_name: "xAI",
             auth_env: "XAI_API_KEY",
             base_url_env: "XAI_BASE_URL",
             default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
@@ -90,6 +95,7 @@ const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
         "grok-3",
         ProviderMetadata {
             provider: ProviderKind::Xai,
+            provider_name: "xAI",
             auth_env: "XAI_API_KEY",
             base_url_env: "XAI_BASE_URL",
             default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
@@ -99,6 +105,7 @@ const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
         "grok-mini",
         ProviderMetadata {
             provider: ProviderKind::Xai,
+            provider_name: "xAI",
             auth_env: "XAI_API_KEY",
             base_url_env: "XAI_BASE_URL",
             default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
@@ -108,6 +115,7 @@ const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
         "grok-3-mini",
         ProviderMetadata {
             provider: ProviderKind::Xai,
+            provider_name: "xAI",
             auth_env: "XAI_API_KEY",
             base_url_env: "XAI_BASE_URL",
             default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
@@ -117,9 +125,40 @@ const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
         "grok-2",
         ProviderMetadata {
             provider: ProviderKind::Xai,
+            provider_name: "xAI",
             auth_env: "XAI_API_KEY",
             base_url_env: "XAI_BASE_URL",
             default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
+        },
+    ),
+    (
+        "glm-4.7",
+        ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            provider_name: "OpenAI",
+            auth_env: "OPENAI_API_KEY",
+            base_url_env: "OPENAI_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_ZHIPU_CODING_BASE_URL,
+        },
+    ),
+    (
+        "glm-4.7-flash",
+        ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            provider_name: "OpenAI",
+            auth_env: "OPENAI_API_KEY",
+            base_url_env: "OPENAI_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_ZHIPU_CODING_BASE_URL,
+        },
+    ),
+    (
+        "MiniMax-M2.7",
+        ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            provider_name: "MiniMax",
+            auth_env: "MINIMAX_API_KEY",
+            base_url_env: "MINIMAX_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_MINIMAX_BASE_URL,
         },
     ),
 ];
@@ -131,7 +170,7 @@ pub fn resolve_model_alias(model: &str) -> String {
     MODEL_REGISTRY
         .iter()
         .find_map(|(alias, metadata)| {
-            (*alias == lower).then_some(match metadata.provider {
+            (alias.to_ascii_lowercase() == lower).then_some(match metadata.provider {
                 ProviderKind::Anthropic => match *alias {
                     "opus" => "claude-opus-4-6",
                     "sonnet" => "claude-sonnet-4-6",
@@ -144,7 +183,7 @@ pub fn resolve_model_alias(model: &str) -> String {
                     "grok-2" => "grok-2",
                     _ => trimmed,
                 },
-                ProviderKind::OpenAi => trimmed,
+                ProviderKind::OpenAi => *alias,
             })
         })
         .map_or_else(|| trimmed.to_string(), ToOwned::to_owned)
@@ -152,10 +191,11 @@ pub fn resolve_model_alias(model: &str) -> String {
 
 #[must_use]
 pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
-    let canonical = resolve_model_alias(model);
+    let canonical = resolve_model_alias(model).to_ascii_lowercase();
     if canonical.starts_with("claude") {
         return Some(ProviderMetadata {
             provider: ProviderKind::Anthropic,
+            provider_name: "Anthropic",
             auth_env: "ANTHROPIC_API_KEY",
             base_url_env: "ANTHROPIC_BASE_URL",
             default_base_url: anthropic::DEFAULT_BASE_URL,
@@ -164,9 +204,28 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
     if canonical.starts_with("grok") {
         return Some(ProviderMetadata {
             provider: ProviderKind::Xai,
+            provider_name: "xAI",
             auth_env: "XAI_API_KEY",
             base_url_env: "XAI_BASE_URL",
             default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
+        });
+    }
+    if canonical.starts_with("glm") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            provider_name: "OpenAI",
+            auth_env: "OPENAI_API_KEY",
+            base_url_env: "OPENAI_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_ZHIPU_CODING_BASE_URL,
+        });
+    }
+    if canonical.starts_with("minimax") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            provider_name: "MiniMax",
+            auth_env: "MINIMAX_API_KEY",
+            base_url_env: "MINIMAX_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_MINIMAX_BASE_URL,
         });
     }
     None
@@ -206,7 +265,7 @@ pub fn max_tokens_for_model(model: &str) -> u32 {
 
 #[must_use]
 pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
-    let canonical = resolve_model_alias(model);
+    let canonical = resolve_model_alias(model).to_ascii_lowercase();
     match canonical.as_str() {
         "claude-opus-4-6" => Some(ModelTokenLimit {
             max_output_tokens: 32_000,
@@ -219,6 +278,14 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
         "grok-3" | "grok-3-mini" => Some(ModelTokenLimit {
             max_output_tokens: 64_000,
             context_window_tokens: 131_072,
+        }),
+        "glm-4.7" | "glm-4.7-flash" => Some(ModelTokenLimit {
+            max_output_tokens: 128_000,
+            context_window_tokens: 200_000,
+        }),
+        "minimax-m2.7" => Some(ModelTokenLimit {
+            max_output_tokens: 128_000,
+            context_window_tokens: 204_800,
         }),
         _ => None,
     }

@@ -93,6 +93,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: false,
     },
     SlashCommandSpec {
+        name: "paste-image",
+        aliases: &[],
+        summary: "Paste an image from the clipboard into the next user message",
+        argument_hint: None,
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "permissions",
         aliases: &[],
         summary: "Show or switch the active permission mode",
@@ -1074,6 +1081,7 @@ pub enum SlashCommand {
     Model {
         model: Option<String>,
     },
+    PasteImage,
     Permissions {
         mode: Option<String>,
     },
@@ -1273,6 +1281,10 @@ pub fn validate_slash_command_input(
         "model" => SlashCommand::Model {
             model: optional_single_arg(command, &args, "[model]")?,
         },
+        "paste-image" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::PasteImage
+        }
         "permissions" => SlashCommand::Permissions {
             mode: parse_permissions_mode(&args)?,
         },
@@ -2314,8 +2326,7 @@ pub fn resolve_skill_invocation(
             .unwrap_or_default();
         if !skill_token.is_empty() {
             if let Err(error) = resolve_skill_path(cwd, skill_token) {
-                let mut message =
-                    format!("Unknown skill: {skill_token} ({error})");
+                let mut message = format!("Unknown skill: {skill_token} ({error})");
                 let roots = discover_skill_roots(cwd);
                 if let Ok(available) = load_skills_from_roots(&roots) {
                     let names: Vec<String> = available
@@ -2324,15 +2335,10 @@ pub fn resolve_skill_invocation(
                         .map(|s| s.name.clone())
                         .collect();
                     if !names.is_empty() {
-                        message.push_str(&format!(
-                            "\n  Available skills: {}",
-                            names.join(", ")
-                        ));
+                        message.push_str(&format!("\n  Available skills: {}", names.join(", ")));
                     }
                 }
-                message.push_str(
-                    "\n  Usage: /skills [list|install <path>|help|<skill> [args]]",
-                );
+                message.push_str("\n  Usage: /skills [list|install <path>|help|<skill> [args]]");
                 return Err(message);
             }
         }
@@ -3888,6 +3894,7 @@ pub fn handle_slash_command(
         | SlashCommand::Sandbox
         | SlashCommand::Model { .. }
         | SlashCommand::Permissions { .. }
+        | SlashCommand::PasteImage
         | SlashCommand::Clear { .. }
         | SlashCommand::Cost
         | SlashCommand::Resume { .. }
@@ -4144,6 +4151,10 @@ mod tests {
         assert_eq!(
             SlashCommand::parse("/model"),
             Ok(Some(SlashCommand::Model { model: None }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/paste-image"),
+            Ok(Some(SlashCommand::PasteImage))
         );
         assert_eq!(
             SlashCommand::parse("/permissions read-only"),
@@ -4407,7 +4418,7 @@ mod tests {
         assert!(help.contains("/agents [list|help]"));
         assert!(help.contains("/skills [list|install <path>|help|<skill> [args]]"));
         assert!(help.contains("aliases: /skill"));
-        assert_eq!(slash_command_specs().len(), 141);
+        assert_eq!(slash_command_specs().len(), 142);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 

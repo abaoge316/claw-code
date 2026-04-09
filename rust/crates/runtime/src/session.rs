@@ -29,6 +29,10 @@ pub enum ContentBlock {
     Text {
         text: String,
     },
+    Image {
+        media_type: String,
+        data_base64: String,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -199,6 +203,10 @@ impl Session {
 
     pub fn push_user_text(&mut self, text: impl Into<String>) -> Result<(), SessionError> {
         self.push_message(ConversationMessage::user_text(text))
+    }
+
+    pub fn push_user_blocks(&mut self, blocks: Vec<ContentBlock>) -> Result<(), SessionError> {
+        self.push_message(ConversationMessage::user_blocks(blocks))
     }
 
     pub fn record_compaction(&mut self, summary: impl Into<String>, removed_message_count: usize) {
@@ -474,6 +482,15 @@ impl ConversationMessage {
     }
 
     #[must_use]
+    pub fn user_blocks(blocks: Vec<ContentBlock>) -> Self {
+        Self {
+            role: MessageRole::User,
+            blocks,
+            usage: None,
+        }
+    }
+
+    #[must_use]
     pub fn assistant(blocks: Vec<ContentBlock>) -> Self {
         Self {
             role: MessageRole::Assistant,
@@ -579,6 +596,20 @@ impl ContentBlock {
                 object.insert("type".to_string(), JsonValue::String("text".to_string()));
                 object.insert("text".to_string(), JsonValue::String(text.clone()));
             }
+            Self::Image {
+                media_type,
+                data_base64,
+            } => {
+                object.insert("type".to_string(), JsonValue::String("image".to_string()));
+                object.insert(
+                    "media_type".to_string(),
+                    JsonValue::String(media_type.clone()),
+                );
+                object.insert(
+                    "data_base64".to_string(),
+                    JsonValue::String(data_base64.clone()),
+                );
+            }
             Self::ToolUse { id, name, input } => {
                 object.insert(
                     "type".to_string(),
@@ -624,6 +655,10 @@ impl ContentBlock {
         {
             "text" => Ok(Self::Text {
                 text: required_string(object, "text")?,
+            }),
+            "image" => Ok(Self::Image {
+                media_type: required_string(object, "media_type")?,
+                data_base64: required_string(object, "data_base64")?,
             }),
             "tool_use" => Ok(Self::ToolUse {
                 id: required_string(object, "id")?,
@@ -985,6 +1020,24 @@ mod tests {
             17
         );
         assert_eq!(restored.session_id, session.session_id);
+    }
+
+    #[test]
+    fn persists_and_restores_image_blocks_in_user_messages() {
+        let message = ConversationMessage::user_blocks(vec![
+            ContentBlock::Image {
+                media_type: "image/png".to_string(),
+                data_base64: "iVBORw0KGgo=".to_string(),
+            },
+            ContentBlock::Text {
+                text: "describe this".to_string(),
+            },
+        ]);
+
+        let json = message.to_json();
+        let restored = ConversationMessage::from_json(&json).expect("message should restore");
+
+        assert_eq!(restored, message);
     }
 
     #[test]

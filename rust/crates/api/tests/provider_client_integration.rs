@@ -1,7 +1,9 @@
 use std::ffi::OsString;
 use std::sync::{Mutex, OnceLock};
 
-use api::{read_xai_base_url, ApiError, AuthSource, ProviderClient, ProviderKind};
+use api::{
+    read_xai_base_url, ApiError, AuthSource, OpenAiCompatConfig, ProviderClient, ProviderKind,
+};
 
 #[test]
 fn provider_client_routes_grok_aliases_through_xai() {
@@ -11,6 +13,69 @@ fn provider_client_routes_grok_aliases_through_xai() {
     let client = ProviderClient::from_model("grok-mini").expect("grok alias should resolve");
 
     assert_eq!(client.provider_kind(), ProviderKind::Xai);
+}
+
+#[test]
+fn provider_client_routes_glm_models_through_openai_compat() {
+    let _lock = env_lock();
+    let _openai_api_key = EnvVarGuard::set("OPENAI_API_KEY", Some("openai-test-key"));
+    let _openai_base_url = EnvVarGuard::set("OPENAI_BASE_URL", Some("http://127.0.0.1:9"));
+    let _anthropic_api_key = EnvVarGuard::set("ANTHROPIC_API_KEY", None);
+    let _anthropic_auth_token =
+        EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", Some("anthropic-test-token"));
+    let _xai_api_key = EnvVarGuard::set("XAI_API_KEY", None);
+
+    let glm = ProviderClient::from_model("glm-4.7").expect("glm-4.7 should resolve");
+    let flash = ProviderClient::from_model("glm-4.7-flash").expect("glm-4.7-flash should resolve");
+
+    assert_eq!(glm.provider_kind(), ProviderKind::OpenAi);
+    assert_eq!(flash.provider_kind(), ProviderKind::OpenAi);
+}
+
+#[test]
+fn provider_client_routes_minimax_models_through_openai_compat() {
+    let _lock = env_lock();
+    let _minimax_api_key = EnvVarGuard::set("MINIMAX_API_KEY", Some("minimax-test-key"));
+    let _minimax_base_url = EnvVarGuard::set("MINIMAX_BASE_URL", None);
+    let _openai_api_key = EnvVarGuard::set("OPENAI_API_KEY", None);
+    let _anthropic_api_key = EnvVarGuard::set("ANTHROPIC_API_KEY", None);
+    let _anthropic_auth_token = EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", None);
+    let _xai_api_key = EnvVarGuard::set("XAI_API_KEY", None);
+
+    let minimax = ProviderClient::from_model("MiniMax-M2.7").expect("MiniMax model should resolve");
+
+    assert_eq!(minimax.provider_kind(), ProviderKind::OpenAi);
+    match minimax {
+        ProviderClient::OpenAi(client) => {
+            assert_eq!(
+                client.base_url(),
+                OpenAiCompatConfig::minimax().default_base_url
+            );
+        }
+        other => panic!("expected OpenAi client, got {other:?}"),
+    }
+}
+
+#[test]
+fn provider_client_applies_explicit_base_url_override_for_minimax_models() {
+    let _lock = env_lock();
+    let _minimax_api_key = EnvVarGuard::set("MINIMAX_API_KEY", Some("minimax-test-key"));
+    let _minimax_base_url = EnvVarGuard::set("MINIMAX_BASE_URL", Some("http://127.0.0.1:9"));
+    let _openai_api_key = EnvVarGuard::set("OPENAI_API_KEY", None);
+    let _anthropic_api_key = EnvVarGuard::set("ANTHROPIC_API_KEY", None);
+    let _anthropic_auth_token = EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", None);
+    let _xai_api_key = EnvVarGuard::set("XAI_API_KEY", None);
+
+    let minimax =
+        ProviderClient::from_model_with_base_url("MiniMax-M2.7", Some("https://api.minimax.io/v1"))
+            .expect("MiniMax model should resolve");
+
+    match minimax {
+        ProviderClient::OpenAi(client) => {
+            assert_eq!(client.base_url(), "https://api.minimax.io/v1");
+        }
+        other => panic!("expected OpenAi client, got {other:?}"),
+    }
 }
 
 #[test]

@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::json::JsonValue;
 use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
@@ -57,7 +59,9 @@ pub struct RuntimeFeatureConfig {
     plugins: RuntimePluginConfig,
     mcp: McpConfigCollection,
     oauth: Option<OAuthConfig>,
-    model: Option<String>,
+    default_model: Option<String>,
+    models: Vec<String>,
+    model_base_urls: BTreeMap<String, String>,
     permission_mode: Option<ResolvedPermissionMode>,
     permission_rules: RuntimePermissionRuleConfig,
     sandbox: SandboxConfig,
@@ -226,11 +230,52 @@ impl ConfigLoader {
     }
 
     #[must_use]
+    pub fn recent_model_path(&self) -> PathBuf {
+        self.config_home.join("recent-model.txt")
+    }
+
+    pub fn load_recent_model(&self) -> Result<Option<String>, ConfigError> {
+        let path = self.recent_model_path();
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let trimmed = contents.trim();
+        Ok((!trimmed.is_empty()).then(|| trimmed.to_string()))
+    }
+
+    pub fn save_recent_model(&self, model: Option<&str>) -> Result<(), ConfigError> {
+        let path = self.recent_model_path();
+        fs::create_dir_all(&self.config_home)?;
+        match model {
+            Some(model) => {
+                fs::write(path, format!("{model}\n"))?;
+            }
+            None => match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            },
+        }
+        Ok(())
+    }
+
+    #[must_use]
     pub fn discover(&self) -> Vec<ConfigEntry> {
         let user_legacy_path = self.config_home.parent().map_or_else(
             || PathBuf::from(".claw.json"),
             |parent| parent.join(".claw.json"),
         );
+        let project_root = self
+            .cwd
+            .ancestors()
+            .find(|ancestor| {
+                ancestor.join(".claw.json").is_file()
+                    || ancestor.join(".claw").join("settings.json").is_file()
+            })
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.cwd.clone());
         vec![
             ConfigEntry {
                 source: ConfigSource::User,
@@ -242,11 +287,11 @@ impl ConfigLoader {
             },
             ConfigEntry {
                 source: ConfigSource::Project,
-                path: self.cwd.join(".claw.json"),
+                path: project_root.join(".claw.json"),
             },
             ConfigEntry {
                 source: ConfigSource::Project,
-                path: self.cwd.join(".claw").join("settings.json"),
+                path: project_root.join(".claw").join("settings.json"),
             },
             ConfigEntry {
                 source: ConfigSource::Local,
@@ -272,6 +317,20 @@ impl ConfigLoader {
 
         let merged_value = JsonValue::Object(merged.clone());
 
+        let mut default_model = parse_optional_default_model(&merged_value);
+        let (mut models, mut model_base_urls) = parse_optional_models(&merged_value)?;
+        if models.is_empty() {
+            if let Some((fallback_default_model, fallback_models, fallback_base_urls)) =
+                builtin_model_registry()
+            {
+                default_model = default_model.or(fallback_default_model);
+                models = fallback_models;
+                model_base_urls = fallback_base_urls;
+            }
+        }
+        let (default_model, models, model_base_urls) =
+            normalize_model_registry(default_model, models, model_base_urls);
+
         let feature_config = RuntimeFeatureConfig {
             hooks: parse_optional_hooks_config(&merged_value)?,
             plugins: parse_optional_plugin_config(&merged_value)?,
@@ -279,7 +338,9 @@ impl ConfigLoader {
                 servers: mcp_servers,
             },
             oauth: parse_optional_oauth_config(&merged_value, "merged settings.oauth")?,
-            model: parse_optional_model(&merged_value),
+            default_model,
+            models,
+            model_base_urls,
             permission_mode: parse_optional_permission_mode(&merged_value)?,
             permission_rules: parse_optional_permission_rules(&merged_value)?,
             sandbox: parse_optional_sandbox_config(&merged_value)?,
@@ -291,6 +352,24 @@ impl ConfigLoader {
             feature_config,
         })
     }
+}
+
+fn builtin_model_registry() -> Option<(Option<String>, Vec<String>, BTreeMap<String, String>)> {
+    static REGISTRY: OnceLock<Option<(Option<String>, Vec<String>, BTreeMap<String, String>)>> =
+        OnceLock::new();
+
+    REGISTRY
+        .get_or_init(|| {
+            let parsed = JsonValue::parse(include_str!("../../../.claw.json")).ok()?;
+            let default_model = parse_optional_default_model(&parsed);
+            let (models, model_base_urls) = parse_optional_models(&parsed).ok()?;
+            Some(normalize_model_registry(
+                default_model,
+                models,
+                model_base_urls,
+            ))
+        })
+        .clone()
 }
 
 impl RuntimeConfig {
@@ -349,8 +428,23 @@ impl RuntimeConfig {
     }
 
     #[must_use]
+    pub fn default_model(&self) -> Option<&str> {
+        self.feature_config.default_model.as_deref()
+    }
+
+    #[must_use]
     pub fn model(&self) -> Option<&str> {
-        self.feature_config.model.as_deref()
+        self.default_model()
+    }
+
+    #[must_use]
+    pub fn models(&self) -> &[String] {
+        &self.feature_config.models
+    }
+
+    #[must_use]
+    pub fn model_base_url(&self, model: &str) -> Option<&str> {
+        self.feature_config.model_base_url(model)
     }
 
     #[must_use]
@@ -403,8 +497,26 @@ impl RuntimeFeatureConfig {
     }
 
     #[must_use]
+    pub fn default_model(&self) -> Option<&str> {
+        self.default_model.as_deref()
+    }
+
+    #[must_use]
     pub fn model(&self) -> Option<&str> {
-        self.model.as_deref()
+        self.default_model()
+    }
+
+    #[must_use]
+    pub fn models(&self) -> &[String] {
+        &self.models
+    }
+
+    #[must_use]
+    pub fn model_base_url(&self, model: &str) -> Option<&str> {
+        self.model_base_urls.iter().find_map(|(name, base_url)| {
+            name.eq_ignore_ascii_case(model)
+                .then_some(base_url.as_str())
+        })
     }
 
     #[must_use]
@@ -630,11 +742,77 @@ fn merge_mcp_servers(
     Ok(())
 }
 
-fn parse_optional_model(root: &JsonValue) -> Option<String> {
-    root.as_object()
-        .and_then(|object| object.get("model"))
-        .and_then(JsonValue::as_str)
-        .map(ToOwned::to_owned)
+fn parse_optional_default_model(root: &JsonValue) -> Option<String> {
+    root.as_object().and_then(|object| {
+        object
+            .get("defaultModel")
+            .or_else(|| object.get("model"))
+            .and_then(JsonValue::as_str)
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn parse_optional_models(
+    root: &JsonValue,
+) -> Result<(Vec<String>, BTreeMap<String, String>), ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok((Vec::new(), BTreeMap::new()));
+    };
+    let Some(value) = object.get("models") else {
+        return Ok((Vec::new(), BTreeMap::new()));
+    };
+    let Some(array) = value.as_array() else {
+        return Err(ConfigError::Parse(
+            "merged settings.models: field models must be an array".to_string(),
+        ));
+    };
+
+    let mut models = Vec::new();
+    let mut model_base_urls = BTreeMap::new();
+    for (index, value) in array.iter().enumerate() {
+        match value {
+            JsonValue::String(model) => {
+                push_unique(&mut models, model.to_string());
+            }
+            JsonValue::Object(entry) => {
+                let Some(model) = entry.get("name").and_then(JsonValue::as_str) else {
+                    return Err(ConfigError::Parse(format!(
+                        "merged settings.models[{index}]: field name must be a string"
+                    )));
+                };
+                push_unique(&mut models, model.to_string());
+                if let Some(base_url_value) = entry.get("baseUrl") {
+                    let Some(base_url) = base_url_value.as_str() else {
+                        return Err(ConfigError::Parse(format!(
+                            "merged settings.models[{index}].baseUrl: field must be a string"
+                        )));
+                    };
+                    model_base_urls.insert(model.to_string(), base_url.to_string());
+                }
+            }
+            _ => {
+                return Err(ConfigError::Parse(format!(
+                    "merged settings.models[{index}]: field must be a string or object"
+                )));
+            }
+        }
+    }
+
+    Ok((models, model_base_urls))
+}
+
+fn normalize_model_registry(
+    default_model: Option<String>,
+    mut models: Vec<String>,
+    model_base_urls: BTreeMap<String, String>,
+) -> (Option<String>, Vec<String>, BTreeMap<String, String>) {
+    let default_model = default_model.or_else(|| models.first().cloned());
+    if let Some(default_model) = default_model.clone() {
+        if !models.iter().any(|model| model == &default_model) {
+            models.insert(0, default_model);
+        }
+    }
+    (default_model, models, model_base_urls)
 }
 
 fn parse_optional_hooks_config(root: &JsonValue) -> Result<RuntimeHookConfig, ConfigError> {
@@ -1205,6 +1383,86 @@ mod tests {
         assert_eq!(loaded.permission_rules().ask(), &["Edit".to_string()]);
         assert!(loaded.mcp().get("home").is_some());
         assert!(loaded.mcp().get("project").is_some());
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn saves_and_loads_recent_model_preference_in_user_config_home() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::create_dir_all(&home).expect("home config dir");
+
+        let loader = ConfigLoader::new(&cwd, &home);
+        loader
+            .save_recent_model(Some("glm-4.7"))
+            .expect("recent model should save");
+
+        let stored = loader
+            .load_recent_model()
+            .expect("recent model should load");
+        assert_eq!(stored.as_deref(), Some("glm-4.7"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn discovers_project_models_from_parent_directory() {
+        let root = temp_dir();
+        let cwd = root.join("project").join("nested");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&cwd).expect("nested cwd");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::write(
+            root.join("project").join(".claw.json"),
+            r#"{
+                "defaultModel":"glm-4.7",
+                "models":[
+                    {"name":"glm-4.7","baseUrl":"https://open.bigmodel.cn/api/coding/paas/v4"},
+                    {"name":"MiniMax-M2.7","baseUrl":"https://api.minimax.io/v1"}
+                ]
+            }"#,
+        )
+        .expect("write project config");
+
+        let loader = ConfigLoader::new(&cwd, &home);
+        let loaded = loader.load().expect("config should load");
+
+        assert_eq!(loaded.default_model(), Some("glm-4.7"));
+        assert_eq!(loaded.models(), &["glm-4.7".to_string(), "MiniMax-M2.7".to_string()]);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn falls_back_to_builtin_model_registry_when_no_project_models_are_configured() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::write(home.join("settings.json"), r#"{"model":"glm-4.7"}"#)
+            .expect("write user settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        assert_eq!(loaded.default_model(), Some("glm-4.7"));
+        assert_eq!(
+            loaded.models(),
+            &[
+                "glm-4.7".to_string(),
+                "glm-4.7-flash".to_string(),
+                "MiniMax-M2.7".to_string(),
+            ]
+        );
+        assert_eq!(
+            loaded.model_base_url("MiniMax-M2.7"),
+            Some("https://api.minimax.io/v1")
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

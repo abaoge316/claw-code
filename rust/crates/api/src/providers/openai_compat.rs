@@ -16,6 +16,8 @@ use super::{preflight_message_request, Provider, ProviderFuture};
 
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+pub const DEFAULT_ZHIPU_CODING_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
+pub const DEFAULT_MINIMAX_BASE_URL: &str = "https://api.minimax.io/v1";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
@@ -32,6 +34,7 @@ pub struct OpenAiCompatConfig {
 
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
 const OPENAI_ENV_VARS: &[&str] = &["OPENAI_API_KEY"];
+const MINIMAX_ENV_VARS: &[&str] = &["MINIMAX_API_KEY"];
 
 impl OpenAiCompatConfig {
     #[must_use]
@@ -53,11 +56,23 @@ impl OpenAiCompatConfig {
             default_base_url: DEFAULT_OPENAI_BASE_URL,
         }
     }
+
+    #[must_use]
+    pub const fn minimax() -> Self {
+        Self {
+            provider_name: "MiniMax",
+            api_key_env: "MINIMAX_API_KEY",
+            base_url_env: "MINIMAX_BASE_URL",
+            default_base_url: DEFAULT_MINIMAX_BASE_URL,
+        }
+    }
+
     #[must_use]
     pub fn credential_env_vars(self) -> &'static [&'static str] {
         match self.provider_name {
             "xAI" => XAI_ENV_VARS,
             "OpenAI" => OPENAI_ENV_VARS,
+            "MiniMax" => MINIMAX_ENV_VARS,
             _ => &[],
         }
     }
@@ -78,6 +93,9 @@ impl OpenAiCompatClient {
     const fn config(&self) -> OpenAiCompatConfig {
         self.config
     }
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
     #[must_use]
     pub fn new(api_key: impl Into<String>, config: OpenAiCompatConfig) -> Self {
         Self {
@@ -92,13 +110,24 @@ impl OpenAiCompatClient {
     }
 
     pub fn from_env(config: OpenAiCompatConfig) -> Result<Self, ApiError> {
+        Self::from_env_with_base_url(config, None)
+    }
+
+    pub fn from_env_with_base_url(
+        config: OpenAiCompatConfig,
+        base_url_override: Option<&str>,
+    ) -> Result<Self, ApiError> {
         let Some(api_key) = read_env_non_empty(config.api_key_env)? else {
             return Err(ApiError::missing_credentials(
                 config.provider_name,
                 config.credential_env_vars(),
             ));
         };
-        Ok(Self::new(api_key, config))
+        let client = Self::new(api_key, config);
+        Ok(match base_url_override {
+            Some(base_url) => client.with_base_url(base_url),
+            None => client,
+        })
     }
 
     #[must_use]
@@ -690,6 +719,7 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
                             "arguments": input.to_string(),
                         }
                     })),
+                    InputContentBlock::Image { .. } => {}
                     InputContentBlock::ToolResult { .. } => {}
                 }
             }
@@ -703,27 +733,86 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
                 })]
             }
         }
-        _ => message
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                InputContentBlock::Text { text } => Some(json!({
-                    "role": "user",
-                    "content": text,
-                })),
-                InputContentBlock::ToolResult {
-                    tool_use_id,
-                    content,
-                    is_error,
-                } => Some(json!({
+        _ => translate_user_message(message),
+    }
+}
+
+fn translate_user_message(message: &InputMessage) -> Vec<Value> {
+    let mut translated = Vec::new();
+    let mut segment = Vec::new();
+
+    for block in &message.content {
+        match block {
+            InputContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => {
+                flush_user_segment(&mut translated, &segment);
+                segment.clear();
+                translated.push(json!({
                     "role": "tool",
                     "tool_call_id": tool_use_id,
                     "content": flatten_tool_result_content(content),
                     "is_error": is_error,
-                })),
-                InputContentBlock::ToolUse { .. } => None,
-            })
-            .collect(),
+                }));
+            }
+            InputContentBlock::ToolUse { .. } => {}
+            InputContentBlock::Text { .. } | InputContentBlock::Image { .. } => {
+                segment.push(block);
+            }
+        }
+    }
+
+    flush_user_segment(&mut translated, &segment);
+    translated
+}
+
+fn flush_user_segment(translated: &mut Vec<Value>, segment: &[&InputContentBlock]) {
+    if segment.is_empty() {
+        return;
+    }
+
+    if segment
+        .iter()
+        .any(|block| matches!(block, InputContentBlock::Image { .. }))
+    {
+        translated.push(json!({
+            "role": "user",
+            "content": segment
+                .iter()
+                .filter_map(|block| openai_content_part(block))
+                .collect::<Vec<_>>(),
+        }));
+        return;
+    }
+
+    for block in segment {
+        if let Some(content) = openai_content_part(block) {
+            translated.push(json!({
+                "role": "user",
+                "content": content,
+            }));
+        }
+    }
+}
+
+fn openai_content_part(block: &InputContentBlock) -> Option<Value> {
+    match block {
+        InputContentBlock::Text { text } => Some(json!({
+            "type": "text",
+            "text": text,
+        })),
+        InputContentBlock::Image {
+            media_type,
+            data_base64,
+        } => Some(json!({
+            "type": "image_url",
+            "image_url": {
+                "url": format!("data:{};base64,{}", media_type, data_base64),
+            }
+        })),
+        InputContentBlock::ToolUse { .. } | InputContentBlock::ToolResult { .. } => None,
     }
 }
 
@@ -1004,6 +1093,48 @@ mod tests {
         assert_eq!(payload["messages"][2]["role"], json!("tool"));
         assert_eq!(payload["tools"][0]["type"], json!("function"));
         assert_eq!(payload["tool_choice"], json!("auto"));
+    }
+
+    #[test]
+    fn request_translation_serializes_image_blocks_as_openai_content_parts() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "gpt-4.1".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage {
+                    role: "user".to_string(),
+                    content: vec![
+                        InputContentBlock::Image {
+                            media_type: "image/png".to_string(),
+                            data_base64: "iVBORw0KGgo=".to_string(),
+                        },
+                        InputContentBlock::Text {
+                            text: "what is in this image?".to_string(),
+                        },
+                    ],
+                }],
+                system: None,
+                tools: None,
+                tool_choice: None,
+                stream: false,
+            },
+            OpenAiCompatConfig::openai(),
+        );
+
+        assert_eq!(payload["messages"][0]["role"], json!("user"));
+        assert_eq!(
+            payload["messages"][0]["content"][0]["type"],
+            json!("image_url")
+        );
+        assert_eq!(
+            payload["messages"][0]["content"][0]["image_url"]["url"],
+            json!("data:image/png;base64,iVBORw0KGgo=")
+        );
+        assert_eq!(payload["messages"][0]["content"][1]["type"], json!("text"));
+        assert_eq!(
+            payload["messages"][0]["content"][1]["text"],
+            json!("what is in this image?")
+        );
     }
 
     #[test]

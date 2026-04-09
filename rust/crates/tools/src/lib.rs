@@ -22,10 +22,10 @@ use runtime::{
     team_cron_registry::{CronRegistry, TeamRegistry},
     worker_boot::{WorkerReadySnapshot, WorkerRegistry},
     write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
-    BranchFreshness, ContentBlock, ConversationMessage, ConversationRuntime, GrepSearchInput,
-    LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName, LaneEventStatus,
-    LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode, PermissionPolicy,
-    PromptCacheEvent, RuntimeError, Session, TaskPacket, ToolError, ToolExecutor,
+    BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
+    GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName,
+    LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode,
+    PermissionPolicy, PromptCacheEvent, RuntimeError, Session, TaskPacket, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -3710,7 +3710,13 @@ impl ProviderRuntimeClient {
     #[allow(clippy::needless_pass_by_value)]
     fn new(model: String, allowed_tools: BTreeSet<String>) -> Result<Self, String> {
         let model = resolve_model_alias(&model).clone();
-        let client = ProviderClient::from_model(&model).map_err(|error| error.to_string())?;
+        let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+        let runtime_config = ConfigLoader::default_for(&cwd)
+            .load()
+            .map_err(|error| error.to_string())?;
+        let base_url = runtime_config.model_base_url(&model);
+        let client = ProviderClient::from_model_with_base_url(&model, base_url)
+            .map_err(|error| error.to_string())?;
         Ok(Self {
             runtime: tokio::runtime::Runtime::new().map_err(|error| error.to_string())?,
             client,
@@ -3886,6 +3892,13 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                 .iter()
                 .map(|block| match block {
                     ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+                    ContentBlock::Image {
+                        media_type,
+                        data_base64,
+                    } => InputContentBlock::Image {
+                        media_type: media_type.clone(),
+                        data_base64: data_base64.clone(),
+                    },
                     ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),

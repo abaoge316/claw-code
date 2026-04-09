@@ -1,0 +1,17 @@
+{
+  "defaultModel": "glm-4.7",
+  "models": [
+    {
+      "name": "glm-4.7",
+      "baseUrl": "https://open.bigmodel.cn/api/coding/paas/v4"
+    },
+    {
+      "name": "glm-4.7-flash",
+      "baseUrl": "https://open.bigmodel.cn/api/coding/paas/v4"
+    },
+    {
+      "name": "MiniMax-M2.7",
+      "baseUrl": "https://api.minimax.io/v1"
+    }
+  ]
+}

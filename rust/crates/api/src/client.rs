@@ -15,12 +15,27 @@ pub enum ProviderClient {
 
 impl ProviderClient {
     pub fn from_model(model: &str) -> Result<Self, ApiError> {
-        Self::from_model_with_anthropic_auth(model, None)
+        Self::from_model_with_overrides(model, None, None)
     }
 
     pub fn from_model_with_anthropic_auth(
         model: &str,
         anthropic_auth: Option<AuthSource>,
+    ) -> Result<Self, ApiError> {
+        Self::from_model_with_overrides(model, anthropic_auth, None)
+    }
+
+    pub fn from_model_with_base_url(
+        model: &str,
+        base_url_override: Option<&str>,
+    ) -> Result<Self, ApiError> {
+        Self::from_model_with_overrides(model, None, base_url_override)
+    }
+
+    pub fn from_model_with_overrides(
+        model: &str,
+        anthropic_auth: Option<AuthSource>,
+        base_url_override: Option<&str>,
     ) -> Result<Self, ApiError> {
         let resolved_model = providers::resolve_model_alias(model);
         match providers::detect_provider_kind(&resolved_model) {
@@ -28,12 +43,24 @@ impl ProviderClient {
                 Some(auth) => AnthropicClient::from_auth(auth),
                 None => AnthropicClient::from_env()?,
             })),
-            ProviderKind::Xai => Ok(Self::Xai(OpenAiCompatClient::from_env(
+            ProviderKind::Xai => Ok(Self::Xai(OpenAiCompatClient::from_env_with_base_url(
                 OpenAiCompatConfig::xai(),
+                base_url_override,
             )?)),
-            ProviderKind::OpenAi => Ok(Self::OpenAi(OpenAiCompatClient::from_env(
-                OpenAiCompatConfig::openai(),
-            )?)),
+            ProviderKind::OpenAi => {
+                let config = providers::metadata_for_model(&resolved_model)
+                    .map(|metadata| OpenAiCompatConfig {
+                        provider_name: metadata.provider_name,
+                        api_key_env: metadata.auth_env,
+                        base_url_env: metadata.base_url_env,
+                        default_base_url: metadata.default_base_url,
+                    })
+                    .unwrap_or_else(OpenAiCompatConfig::openai);
+                Ok(Self::OpenAi(OpenAiCompatClient::from_env_with_base_url(
+                    config,
+                    base_url_override,
+                )?))
+            }
         }
     }
 
@@ -135,6 +162,10 @@ pub fn read_xai_base_url() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, OnceLock};
+
+    use super::ProviderClient;
+    use crate::providers::openai_compat::DEFAULT_ZHIPU_CODING_BASE_URL;
     use crate::providers::{detect_provider_kind, resolve_model_alias, ProviderKind};
 
     #[test]
@@ -151,5 +182,53 @@ mod tests {
             detect_provider_kind("claude-sonnet-4-6"),
             ProviderKind::Anthropic
         );
+    }
+
+    #[test]
+    fn glm_models_default_to_the_zhipu_coding_endpoint() {
+        let _lock = env_lock();
+        let _openai_api_key = EnvVarGuard::set("OPENAI_API_KEY", Some("openai-test-key"));
+        let _openai_base_url = EnvVarGuard::set("OPENAI_BASE_URL", None);
+
+        let client = ProviderClient::from_model("glm-4.7").expect("glm model should resolve");
+
+        match client {
+            ProviderClient::OpenAi(client) => {
+                assert_eq!(client.base_url(), DEFAULT_ZHIPU_CODING_BASE_URL);
+            }
+            other => panic!("expected OpenAi client, got {other:?}"),
+        }
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let original = std::env::var_os(key);
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
     }
 }

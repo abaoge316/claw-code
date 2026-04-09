@@ -26,8 +26,8 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use api::{
     oauth_token_is_expired, resolve_startup_auth_source, AnthropicClient, AuthSource,
     ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, PromptCache, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
-    ToolResultContentBlock,
+    OutputContentBlock, PromptCache, ProviderClient, StreamEvent as ApiStreamEvent, ToolChoice,
+    ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -49,13 +49,14 @@ use runtime::{
     ConversationMessage, ConversationRuntime, McpServerManager, McpTool, MessageRole, ModelPricing,
     OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest, PermissionMode,
     PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError,
-    Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    Session, TokenUsage, ToolError, ToolExecutor, UsageTracker, UserTurnInput,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tools::{GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
+const REQUEST_FAILURE_FALLBACK_MODEL: &str = "glm-4.7";
 fn max_tokens_for_model(model: &str) -> u32 {
     if model.contains("opus") {
         32_000
@@ -113,7 +114,14 @@ Run `claw --help` for usage."
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
-    match parse_args(&args)? {
+    let has_explicit_model_override = args_include_model_override(&args);
+    let action = parse_args(&args)?;
+    let action = if has_explicit_model_override {
+        action
+    } else {
+        apply_config_model_default(action)
+    };
+    match action {
         CliAction::DumpManifests { output_format } => dump_manifests(output_format)?,
         CliAction::BootstrapPlan { output_format } => print_bootstrap_plan(output_format)?,
         CliAction::Agents {
@@ -744,6 +752,37 @@ fn resolve_model_alias(model: &str) -> &str {
     }
 }
 
+fn args_include_model_override(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| arg == "--model" || arg.starts_with("--model="))
+}
+
+fn apply_config_model_default(mut action: CliAction) -> CliAction {
+    let Some(model) = config_model_for_current_dir() else {
+        return action;
+    };
+
+    match &mut action {
+        CliAction::Status {
+            model: action_model,
+            ..
+        }
+        | CliAction::Prompt {
+            model: action_model,
+            ..
+        }
+        | CliAction::Repl {
+            model: action_model,
+            ..
+        } => {
+            *action_model = model;
+        }
+        _ => {}
+    }
+
+    action
+}
+
 fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, String> {
     if values.is_empty() {
         return Ok(None);
@@ -813,6 +852,148 @@ fn config_permission_mode_for_current_dir() -> Option<PermissionMode> {
         .ok()?
         .permission_mode()
         .map(permission_mode_from_resolved)
+}
+
+fn config_model_for_current_dir() -> Option<String> {
+    let cwd = env::current_dir().ok()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    loader
+        .load_recent_model()
+        .ok()
+        .flatten()
+        .map(|model| resolve_model_alias(&model).to_string())
+        .or_else(|| {
+            loader
+                .load()
+                .ok()?
+                .default_model()
+                .map(|model| resolve_model_alias(model).to_string())
+        })
+}
+
+fn save_recent_model_for_current_dir(model: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    loader.save_recent_model(Some(model))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_clipboard_image_block() -> Result<ContentBlock, Box<dyn std::error::Error>> {
+    let image_path = capture_clipboard_image_path()?;
+    let image_bytes = fs::read(&image_path)?;
+    let _ = fs::remove_file(&image_path);
+    if image_bytes.is_empty() {
+        return Err("clipboard image was empty".into());
+    }
+
+    Ok(ContentBlock::Image {
+        media_type: "image/png".to_string(),
+        data_base64: base64_encode(&image_bytes),
+    })
+}
+
+#[cfg(not(windows))]
+fn read_clipboard_image_block() -> Result<ContentBlock, Box<dyn std::error::Error>> {
+    Err("paste-image is only supported on Windows".into())
+}
+
+#[cfg(windows)]
+fn capture_clipboard_image_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    const SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Drawing | Out-Null
+$image = Get-Clipboard -Format Image
+if ($null -eq $image) {
+    throw 'clipboard does not contain an image'
+}
+$path = Join-Path $env:TEMP ('claw-clipboard-' + [guid]::NewGuid().ToString() + '.png')
+$image.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+Write-Output $path
+"#;
+
+    let mut last_error = None;
+    for shell in ["powershell", "pwsh"] {
+        let output = Command::new(shell)
+            .args(["-Sta", "-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+            .output();
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                last_error = Some(error.to_string());
+                continue;
+            }
+        };
+
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return Ok(PathBuf::from(path));
+            }
+            last_error = Some("clipboard image command returned an empty path".to_string());
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            last_error = Some(if stderr.is_empty() {
+                "clipboard image command failed".to_string()
+            } else {
+                stderr
+            });
+        }
+    }
+
+    Err(last_error
+        .unwrap_or_else(|| "failed to read clipboard image".to_string())
+        .into())
+}
+
+#[cfg(windows)]
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(((bytes.len() + 2) / 3) * 4);
+    let mut chunks = bytes.chunks_exact(3);
+    for chunk in &mut chunks {
+        let triple = ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | chunk[2] as u32;
+        encoded.push(TABLE[((triple >> 18) & 0x3f) as usize] as char);
+        encoded.push(TABLE[((triple >> 12) & 0x3f) as usize] as char);
+        encoded.push(TABLE[((triple >> 6) & 0x3f) as usize] as char);
+        encoded.push(TABLE[(triple & 0x3f) as usize] as char);
+    }
+
+    let remainder = chunks.remainder();
+    if !remainder.is_empty() {
+        let mut triple = (remainder[0] as u32) << 16;
+        if remainder.len() == 2 {
+            triple |= (remainder[1] as u32) << 8;
+        }
+        encoded.push(TABLE[((triple >> 18) & 0x3f) as usize] as char);
+        encoded.push(TABLE[((triple >> 12) & 0x3f) as usize] as char);
+        match remainder.len() {
+            1 => {
+                encoded.push('=');
+                encoded.push('=');
+            }
+            2 => {
+                encoded.push(TABLE[((triple >> 6) & 0x3f) as usize] as char);
+                encoded.push('=');
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    encoded
+}
+
+fn config_models_for_current_dir() -> Vec<String> {
+    let cwd = match env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(_) => return Vec::new(),
+    };
+    let loader = ConfigLoader::default_for(&cwd);
+    loader
+        .load()
+        .ok()
+        .map(|config| config.models().to_vec())
+        .unwrap_or_default()
 }
 
 fn filter_tool_specs(
@@ -1254,7 +1435,7 @@ fn check_config_health(
                 loaded_entries.len(),
                 discovered_count
             )];
-            if let Some(model) = runtime_config.model() {
+            if let Some(model) = runtime_config.default_model() {
                 details.push(format!("Resolved model    {model}"));
             }
             details.push(format!(
@@ -1294,7 +1475,10 @@ fn check_config_health(
                     "loaded_config_files".to_string(),
                     json!(loaded_entries.len()),
                 ),
-                ("resolved_model".to_string(), json!(runtime_config.model())),
+                (
+                    "resolved_model".to_string(),
+                    json!(runtime_config.default_model()),
+                ),
                 (
                     "mcp_servers".to_string(),
                     json!(runtime_config.mcp().servers().len()),
@@ -1464,7 +1648,8 @@ fn check_sandbox_health(status: &runtime::SandboxStatus) -> DiagnosticCheck {
 }
 
 fn check_system_health(cwd: &Path, config: Option<&runtime::RuntimeConfig>) -> DiagnosticCheck {
-    let default_model = config.and_then(runtime::RuntimeConfig::model);
+    let default_model = config.and_then(runtime::RuntimeConfig::default_model);
+    let configured_models: &[String] = config.map(runtime::RuntimeConfig::models).unwrap_or(&[]);
     let mut details = vec![
         format!("OS               {} {}", env::consts::OS, env::consts::ARCH),
         format!("Working dir      {}", cwd.display()),
@@ -1474,6 +1659,9 @@ fn check_system_health(cwd: &Path, config: Option<&runtime::RuntimeConfig>) -> D
     ];
     if let Some(model) = default_model {
         details.push(format!("Default model    {model}"));
+    }
+    if !configured_models.is_empty() {
+        details.push(format!("Models           {}", configured_models.join(", ")));
     }
     DiagnosticCheck::new(
         "System",
@@ -1489,6 +1677,7 @@ fn check_system_health(cwd: &Path, config: Option<&runtime::RuntimeConfig>) -> D
         ("build_target".to_string(), json!(BUILD_TARGET)),
         ("git_sha".to_string(), json!(GIT_SHA)),
         ("default_model".to_string(), json!(default_model)),
+        ("models".to_string(), json!(configured_models)),
     ]))
 }
 
@@ -1946,10 +2135,21 @@ fn format_unknown_slash_command_message(name: &str) -> String {
     message
 }
 
-fn format_model_report(model: &str, message_count: usize, turns: u32) -> String {
+fn format_model_report(
+    model: &str,
+    available_models: &[String],
+    message_count: usize,
+    turns: u32,
+) -> String {
+    let models = if available_models.is_empty() {
+        model.to_string()
+    } else {
+        available_models.join(", ")
+    };
     format!(
         "Model
   Current model    {model}
+  Available models {models}
   Session messages {message_count}
   Session turns    {turns}
 
@@ -2377,6 +2577,10 @@ fn run_resume_command(
                 json: Some(handle_skills_slash_command_json(args.as_deref(), &cwd)?),
             })
         }
+        SlashCommand::PasteImage => Err(
+            "resumed /paste-image is interactive-only; start `claw` and run `/paste-image` in the REPL"
+                .into(),
+        ),
         SlashCommand::Doctor => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_doctor_report()?.render()),
@@ -2452,7 +2656,17 @@ fn run_repl(
         match editor.read_line()? {
             input::ReadOutcome::Submit(input) => {
                 let trimmed = input.trim().to_string();
+                if trimmed.is_empty() && cli.pending_user_blocks.is_empty() {
+                    continue;
+                }
                 if trimmed.is_empty() {
+                    let turn_input =
+                        UserTurnInput::Blocks(std::mem::take(&mut cli.pending_user_blocks));
+                    if cli.run_turn_recoverable(turn_input)
+                        && !cli.pending_user_blocks.is_empty()
+                    {
+                        cli.pending_user_blocks.clear();
+                    }
                     continue;
                 }
                 if matches!(trimmed.as_str(), "/exit" | "/quit") {
@@ -2461,8 +2675,15 @@ fn run_repl(
                 }
                 match SlashCommand::parse(&trimmed) {
                     Ok(Some(command)) => {
-                        if cli.handle_repl_command(command)? {
-                            cli.persist_session()?;
+                        match cli.handle_repl_command(command) {
+                            Ok(persist_session) => {
+                                if persist_session {
+                                    cli.persist_session()?;
+                                }
+                            }
+                            Err(error) => {
+                                eprintln!("{error}");
+                            }
                         }
                         continue;
                     }
@@ -2473,7 +2694,18 @@ fn run_repl(
                     }
                 }
                 editor.push_history(input);
-                cli.run_turn(&trimmed)?;
+                let turn_input = if cli.pending_user_blocks.is_empty() {
+                    UserTurnInput::from(trimmed.as_str())
+                } else {
+                    let mut blocks = cli.pending_user_blocks.clone();
+                    blocks.push(ContentBlock::Text {
+                        text: trimmed.clone(),
+                    });
+                    UserTurnInput::Blocks(blocks)
+                };
+                if cli.run_turn_recoverable(turn_input) && !cli.pending_user_blocks.is_empty() {
+                    cli.pending_user_blocks.clear();
+                }
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
@@ -2509,6 +2741,7 @@ struct LiveCli {
     system_prompt: Vec<String>,
     runtime: BuiltRuntime,
     session: SessionHandle,
+    pending_user_blocks: Vec<ContentBlock>,
 }
 
 struct RuntimePluginState {
@@ -3010,6 +3243,7 @@ impl LiveCli {
             system_prompt,
             runtime,
             session,
+            pending_user_blocks: Vec::new(),
         };
         cli.persist_session()?;
         Ok(cli)
@@ -3070,6 +3304,15 @@ impl LiveCli {
         ))
     }
 
+    fn queue_clipboard_image(
+        &mut self,
+        image: ContentBlock,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.pending_user_blocks.push(image);
+        println!("Queued clipboard image. It will be attached to your next message.");
+        Ok(())
+    }
+
     fn prepare_turn_runtime(
         &self,
         emit_output: bool,
@@ -3098,7 +3341,10 @@ impl LiveCli {
         Ok(())
     }
 
-    fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+    fn run_turn(
+        &mut self,
+        input: impl Into<UserTurnInput>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
@@ -3130,13 +3376,39 @@ impl LiveCli {
             }
             Err(error) => {
                 runtime.shutdown_plugins()?;
+                self.replace_runtime(runtime)?;
                 spinner.fail(
                     "❌ Request failed",
                     TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
+                self.persist_session()?;
                 Err(Box::new(error))
             }
+        }
+    }
+
+    fn run_turn_recoverable(&mut self, input: impl Into<UserTurnInput>) -> bool {
+        match self.run_turn(input) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("{error}");
+                self.switch_to_request_failure_fallback_model();
+                false
+            }
+        }
+    }
+
+    fn switch_to_request_failure_fallback_model(&mut self) {
+        if self.model.eq_ignore_ascii_case(REQUEST_FAILURE_FALLBACK_MODEL) {
+            return;
+        }
+
+        if let Err(error) = self.set_model(Some(REQUEST_FAILURE_FALLBACK_MODEL.to_string())) {
+            eprintln!(
+                "warning: failed to switch to fallback model {}: {error}",
+                REQUEST_FAILURE_FALLBACK_MODEL
+            );
         }
     }
 
@@ -3240,6 +3512,11 @@ impl LiveCli {
                 false
             }
             SlashCommand::Model { model } => self.set_model(model)?,
+            SlashCommand::PasteImage => {
+                let image = read_clipboard_image_block()?;
+                self.queue_clipboard_image(image)?;
+                false
+            }
             SlashCommand::Permissions { mode } => self.set_permissions(mode)?,
             SlashCommand::Clear { confirm } => self.clear_session(confirm)?,
             SlashCommand::Cost => {
@@ -3293,7 +3570,9 @@ impl LiveCli {
             }
             SlashCommand::Skills { args } => {
                 match classify_skills_slash_command(args.as_deref()) {
-                    SkillSlashDispatch::Invoke(prompt) => self.run_turn(&prompt)?,
+                    SkillSlashDispatch::Invoke(prompt) => {
+                        self.run_turn_recoverable(prompt);
+                    }
                     SkillSlashDispatch::Local => {
                         Self::print_skills(args.as_deref(), CliOutputFormat::Text)?;
                     }
@@ -3391,11 +3670,13 @@ impl LiveCli {
     }
 
     fn set_model(&mut self, model: Option<String>) -> Result<bool, Box<dyn std::error::Error>> {
+        let available_models = config_models_for_current_dir();
         let Some(model) = model else {
             println!(
                 "{}",
                 format_model_report(
                     &self.model,
+                    &available_models,
                     self.runtime.session().messages.len(),
                     self.runtime.usage().turns(),
                 )
@@ -3410,6 +3691,7 @@ impl LiveCli {
                 "{}",
                 format_model_report(
                     &self.model,
+                    &available_models,
                     self.runtime.session().messages.len(),
                     self.runtime.usage().turns(),
                 )
@@ -3420,7 +3702,7 @@ impl LiveCli {
         let previous = self.model.clone();
         let session = self.runtime.session().clone();
         let message_count = session.messages.len();
-        let runtime = build_runtime(
+        let runtime = match build_runtime(
             session,
             &self.session.id,
             model.clone(),
@@ -3430,9 +3712,21 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
-        )?;
-        self.replace_runtime(runtime)?;
+        ) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                eprintln!("{error}");
+                return Ok(false);
+            }
+        };
+        if let Err(error) = self.replace_runtime(runtime) {
+            eprintln!("{error}");
+            return Ok(false);
+        }
         self.model.clone_from(&model);
+        if let Err(error) = save_recent_model_for_current_dir(&model) {
+            eprintln!("warning: failed to remember recent model: {error}");
+        }
         println!(
             "{}",
             format_model_switch_report(&previous, &model, message_count)
@@ -4923,6 +5217,9 @@ fn render_export_text(session: &Session) -> String {
         for block in &message.blocks {
             match block {
                 ContentBlock::Text { text } => lines.push(text.clone()),
+                ContentBlock::Image { media_type, .. } => {
+                    lines.push(format!("[image {media_type}]"));
+                }
                 ContentBlock::ToolUse { id, name, input } => {
                     lines.push(format!("[tool_use id={id} name={name}] {input}"));
                 }
@@ -5460,6 +5757,7 @@ fn build_runtime_with_plugin_state(
     plugin_registry.initialize()?;
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
+    let model_base_url = feature_config.model_base_url(&model);
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         AnthropicRuntimeClient::new(
@@ -5470,6 +5768,7 @@ fn build_runtime_with_plugin_state(
             allowed_tools.clone(),
             tool_registry.clone(),
             progress_reporter,
+            model_base_url,
         )?,
         CliToolExecutor::new(
             allowed_tools.clone(),
@@ -5571,7 +5870,7 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 
 struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: AnthropicClient,
+    client: Option<ProviderClient>,
     session_id: String,
     model: String,
     enable_tools: bool,
@@ -5579,6 +5878,8 @@ struct AnthropicRuntimeClient {
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
+    model_base_url: Option<String>,
+    prompt_cache: PromptCache,
 }
 
 impl AnthropicRuntimeClient {
@@ -5590,12 +5891,11 @@ impl AnthropicRuntimeClient {
         allowed_tools: Option<AllowedToolSet>,
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
+        model_base_url: Option<&str>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
-            client: AnthropicClient::from_auth(resolve_cli_auth_source()?)
-                .with_base_url(api::read_base_url())
-                .with_prompt_cache(PromptCache::new(session_id)),
+            client: None,
             session_id: session_id.to_string(),
             model,
             enable_tools,
@@ -5603,7 +5903,28 @@ impl AnthropicRuntimeClient {
             allowed_tools,
             tool_registry,
             progress_reporter,
+            model_base_url: model_base_url.map(ToOwned::to_owned),
+            prompt_cache: PromptCache::new(session_id),
         })
+    }
+
+    fn ensure_client(&mut self) -> Result<&mut ProviderClient, RuntimeError> {
+        if self.client.is_none() {
+            let client = ProviderClient::from_model_with_base_url(
+                &self.model,
+                self.model_base_url.as_deref(),
+            )
+            .map_err(|error| {
+                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+            })?
+            .with_prompt_cache(self.prompt_cache.clone());
+            self.client = Some(client);
+        }
+
+        Ok(self
+            .client
+            .as_mut()
+            .expect("client should exist after init"))
     }
 }
 
@@ -5651,21 +5972,22 @@ impl ApiClient for AnthropicRuntimeClient {
             stream: true,
         };
 
-        self.runtime.block_on(async {
-            let mut stream =
-                self.client
-                    .stream_message(&message_request)
-                    .await
-                    .map_err(|error| {
-                        RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                    })?;
+        let session_id = self.session_id.clone();
+        let emit_output = self.emit_output;
+        let client = self.ensure_client()?.clone();
+        let progress_reporter = self.progress_reporter.as_ref();
+
+        let runtime = &self.runtime;
+        let result = runtime.block_on(async move {
+            let mut stream = client
+                .stream_message(&message_request)
+                .await
+                .map_err(|error| {
+                    RuntimeError::new(format_user_visible_api_error(&session_id, &error))
+                })?;
             let mut stdout = io::stdout();
             let mut sink = io::sink();
-            let out: &mut dyn Write = if self.emit_output {
-                &mut stdout
-            } else {
-                &mut sink
-            };
+            let out: &mut dyn Write = if emit_output { &mut stdout } else { &mut sink };
             let renderer = TerminalRenderer::new();
             let mut markdown_stream = MarkdownStreamState::default();
             let mut events = Vec::new();
@@ -5674,7 +5996,7 @@ impl ApiClient for AnthropicRuntimeClient {
             let mut saw_stop = false;
 
             while let Some(event) = stream.next_event().await.map_err(|error| {
-                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                RuntimeError::new(format_user_visible_api_error(&session_id, &error))
             })? {
                 match event {
                     ApiStreamEvent::MessageStart(start) => {
@@ -5702,7 +6024,7 @@ impl ApiClient for AnthropicRuntimeClient {
                     ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
                         ContentBlockDelta::TextDelta { text } => {
                             if !text.is_empty() {
-                                if let Some(progress_reporter) = &self.progress_reporter {
+                                if let Some(progress_reporter) = progress_reporter {
                                     progress_reporter.mark_text_phase(&text);
                                 }
                                 if let Some(rendered) = markdown_stream.push(&renderer, &text) {
@@ -5734,10 +6056,9 @@ impl ApiClient for AnthropicRuntimeClient {
                                 .map_err(|error| RuntimeError::new(error.to_string()))?;
                         }
                         if let Some((id, name, input)) = pending_tool.take() {
-                            if let Some(progress_reporter) = &self.progress_reporter {
+                            if let Some(progress_reporter) = progress_reporter {
                                 progress_reporter.mark_tool_phase(&name, &input);
                             }
-                            // Display tool call now that input is fully accumulated
                             writeln!(out, "\n{}", format_tool_call_start(&name, &input))
                                 .and_then(|()| out.flush())
                                 .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -5759,7 +6080,7 @@ impl ApiClient for AnthropicRuntimeClient {
                 }
             }
 
-            push_prompt_cache_record(&self.client, &mut events);
+            push_prompt_cache_record(&client, &mut events);
 
             if !saw_stop
                 && events.iter().any(|event| {
@@ -5770,27 +6091,30 @@ impl ApiClient for AnthropicRuntimeClient {
                 events.push(AssistantEvent::MessageStop);
             }
 
-            if events
+            if !events
                 .iter()
                 .any(|event| matches!(event, AssistantEvent::MessageStop))
             {
-                return Ok(events);
+                let response = client
+                    .send_message(&MessageRequest {
+                        stream: false,
+                        ..message_request.clone()
+                    })
+                    .await
+                    .map_err(|error| {
+                        RuntimeError::new(format_user_visible_api_error(&session_id, &error))
+                    })?;
+                let mut events = response_to_events(response, out)?;
+                push_prompt_cache_record(&client, &mut events);
+                return Ok::<(Vec<AssistantEvent>, ProviderClient), RuntimeError>((events, client));
             }
 
-            let response = self
-                .client
-                .send_message(&MessageRequest {
-                    stream: false,
-                    ..message_request.clone()
-                })
-                .await
-                .map_err(|error| {
-                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                })?;
-            let mut events = response_to_events(response, out)?;
-            push_prompt_cache_record(&self.client, &mut events);
-            Ok(events)
-        })
+            Ok::<(Vec<AssistantEvent>, ProviderClient), RuntimeError>((events, client))
+        });
+
+        let (events, client) = result?;
+        self.client = Some(client);
+        Ok(events)
     }
 }
 
@@ -5833,9 +6157,15 @@ fn format_context_window_blocked_error(session_id: &str, error: &api::ApiError) 
             context_window_tokens,
         } => {
             lines.push(format!("  Model            {model}"));
-            lines.push(format!("  Input estimate   ~{estimated_input_tokens} tokens (heuristic)"));
-            lines.push(format!("  Requested output {requested_output_tokens} tokens"));
-            lines.push(format!("  Total estimate   ~{estimated_total_tokens} tokens (heuristic)"));
+            lines.push(format!(
+                "  Input estimate   ~{estimated_input_tokens} tokens (heuristic)"
+            ));
+            lines.push(format!(
+                "  Requested output {requested_output_tokens} tokens"
+            ));
+            lines.push(format!(
+                "  Total estimate   ~{estimated_total_tokens} tokens (heuristic)"
+            ));
             lines.push(format!("  Context window   {context_window_tokens} tokens"));
         }
         api::ApiError::Api { message, body, .. } => {
@@ -6550,7 +6880,7 @@ fn response_to_events(
     Ok(events)
 }
 
-fn push_prompt_cache_record(client: &AnthropicClient, events: &mut Vec<AssistantEvent>) {
+fn push_prompt_cache_record(client: &ProviderClient, events: &mut Vec<AssistantEvent>) {
     if let Some(record) = client.take_last_prompt_cache_record() {
         if let Some(event) = prompt_cache_record_to_runtime_event(record) {
             events.push(AssistantEvent::PromptCache(event));
@@ -6727,6 +7057,13 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                 .iter()
                 .map(|block| match block {
                     ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+                    ContentBlock::Image {
+                        media_type,
+                        data_base64,
+                    } => InputContentBlock::Image {
+                        media_type: media_type.clone(),
+                        data_base64: data_base64.clone(),
+                    },
                     ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
@@ -8069,6 +8406,38 @@ mod tests {
     }
 
     #[test]
+    fn live_cli_initializes_glm_without_anthropic_credentials() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+        std::env::set_var("OPENAI_API_KEY", "test-openai-key");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+
+        let result = with_current_dir(&root, || {
+            LiveCli::new(
+                "glm-4.7".to_string(),
+                true,
+                None,
+                PermissionMode::DangerFullAccess,
+            )
+        });
+
+        assert!(
+            result.is_ok(),
+            "{}",
+            result
+                .as_ref()
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "unexpected success state".to_string())
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+        std::env::remove_var("OPENAI_API_KEY");
+    }
+
+    #[test]
     fn resume_supported_command_list_matches_expected_surface() {
         let names = resume_supported_slash_commands()
             .into_iter()
@@ -8160,9 +8529,15 @@ mod tests {
 
     #[test]
     fn model_report_uses_sectioned_layout() {
-        let report = format_model_report("claude-sonnet", 12, 4);
+        let report = format_model_report(
+            "claude-sonnet",
+            &["claude-sonnet".to_string(), "claude-opus".to_string()],
+            12,
+            4,
+        );
         assert!(report.contains("Model"));
         assert!(report.contains("Current model    claude-sonnet"));
+        assert!(report.contains("Available models claude-sonnet, claude-opus"));
         assert!(report.contains("Session messages 12"));
         assert!(report.contains("Switch models with /model <name>"));
     }

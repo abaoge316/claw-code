@@ -25,6 +25,40 @@ pub struct ApiRequest {
     pub messages: Vec<ConversationMessage>,
 }
 
+/// User input accepted by a single conversation turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserTurnInput {
+    Text(String),
+    Blocks(Vec<ContentBlock>),
+}
+
+impl UserTurnInput {
+    fn record_label(&self) -> String {
+        match self {
+            Self::Text(text) => text.clone(),
+            Self::Blocks(blocks) => summarize_user_blocks(blocks),
+        }
+    }
+}
+
+impl From<String> for UserTurnInput {
+    fn from(value: String) -> Self {
+        Self::Text(value)
+    }
+}
+
+impl From<&str> for UserTurnInput {
+    fn from(value: &str) -> Self {
+        Self::Text(value.to_string())
+    }
+}
+
+impl From<Vec<ContentBlock>> for UserTurnInput {
+    fn from(value: Vec<ContentBlock>) -> Self {
+        Self::Blocks(value)
+    }
+}
+
 /// Streamed events emitted while processing a single assistant turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssistantEvent {
@@ -295,14 +329,29 @@ where
     #[allow(clippy::too_many_lines)]
     pub fn run_turn(
         &mut self,
-        user_input: impl Into<String>,
+        user_input: impl Into<UserTurnInput>,
         mut prompter: Option<&mut dyn PermissionPrompter>,
     ) -> Result<TurnSummary, RuntimeError> {
         let user_input = user_input.into();
-        self.record_turn_started(&user_input);
-        self.session
-            .push_user_text(user_input)
-            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        let record_label = user_input.record_label();
+        self.record_turn_started(&record_label);
+        match user_input {
+            UserTurnInput::Text(text) => self
+                .session
+                .push_user_text(text)
+                .map_err(|error| RuntimeError::new(error.to_string()))?,
+            UserTurnInput::Blocks(blocks) => {
+                if blocks.is_empty() {
+                    let error =
+                        RuntimeError::new("user turn must include at least one content block");
+                    self.record_turn_failed(1, &error);
+                    return Err(error);
+                }
+                self.session
+                    .push_user_blocks(blocks)
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+            }
+        }
 
         let mut assistant_messages = Vec::new();
         let mut tool_results = Vec::new();
@@ -552,6 +601,17 @@ where
         session_tracer.record("turn_started", attributes);
     }
 
+    fn record_turn_failed(&self, iteration: usize, error: &RuntimeError) {
+        let Some(session_tracer) = &self.session_tracer else {
+            return;
+        };
+
+        let mut attributes = Map::new();
+        attributes.insert("iteration".to_string(), Value::from(iteration as u64));
+        attributes.insert("error".to_string(), Value::String(error.to_string()));
+        session_tracer.record("turn_failed", attributes);
+    }
+
     fn record_assistant_iteration(
         &self,
         iteration: usize,
@@ -634,16 +694,26 @@ where
         );
         session_tracer.record("turn_completed", attributes);
     }
+}
 
-    fn record_turn_failed(&self, iteration: usize, error: &RuntimeError) {
-        let Some(session_tracer) = &self.session_tracer else {
-            return;
-        };
+fn summarize_user_blocks(blocks: &[ContentBlock]) -> String {
+    let mut labels = Vec::new();
+    for block in blocks {
+        match block {
+            ContentBlock::Text { text } if !text.trim().is_empty() => {
+                labels.push(text.trim().to_string());
+            }
+            ContentBlock::Image { .. } => labels.push("[image]".to_string()),
+            ContentBlock::ToolUse { .. } => labels.push("[tool use]".to_string()),
+            ContentBlock::ToolResult { .. } => labels.push("[tool result]".to_string()),
+            ContentBlock::Text { .. } => {}
+        }
+    }
 
-        let mut attributes = Map::new();
-        attributes.insert("iteration".to_string(), Value::from(iteration as u64));
-        attributes.insert("error".to_string(), Value::String(error.to_string()));
-        session_tracer.record("turn_failed", attributes);
+    if labels.is_empty() {
+        "[empty user turn]".to_string()
+    } else {
+        labels.join(" ")
     }
 }
 
