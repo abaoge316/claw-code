@@ -13,5 +13,14 @@
       "name": "MiniMax-M2.7",
       "baseUrl": "https://api.minimaxi.com/v1"
     }
-  ]
+  ],
+  "mcpServers": {
+    "MiniMax": {
+      "command": "uvx",
+      "args": ["minimax-coding-plan-mcp", "-y"],
+      "env": {
+        "MINIMAX_API_HOST": "https://api.minimax.io"
+      }
+    }
+  }
 }
