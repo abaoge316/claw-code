@@ -697,7 +697,9 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
             Value::Array(tools.iter().map(openai_tool_definition).collect::<Vec<_>>());
     }
     if let Some(tool_choice) = &request.tool_choice {
-        payload["tool_choice"] = openai_tool_choice(tool_choice);
+        if !matches!(tool_choice, ToolChoice::Auto) {
+            payload["tool_choice"] = openai_tool_choice(tool_choice);
+        }
     }
 
     payload
@@ -787,13 +789,21 @@ fn flush_user_segment(translated: &mut Vec<Value>, segment: &[&InputContentBlock
         return;
     }
 
-    for block in segment {
-        if let Some(content) = openai_content_part(block) {
-            translated.push(json!({
-                "role": "user",
-                "content": content,
-            }));
-        }
+    let text = segment
+        .iter()
+        .filter_map(|block| match block {
+            InputContentBlock::Text { text } => Some(text.as_str()),
+            InputContentBlock::Image { .. }
+            | InputContentBlock::ToolUse { .. }
+            | InputContentBlock::ToolResult { .. } => None,
+        })
+        .collect::<String>();
+
+    if !text.is_empty() {
+        translated.push(json!({
+            "role": "user",
+            "content": text,
+        }));
     }
 }
 
@@ -1092,7 +1102,7 @@ mod tests {
         assert_eq!(payload["messages"][1]["role"], json!("user"));
         assert_eq!(payload["messages"][2]["role"], json!("tool"));
         assert_eq!(payload["tools"][0]["type"], json!("function"));
-        assert_eq!(payload["tool_choice"], json!("auto"));
+        assert!(payload.get("tool_choice").is_none());
     }
 
     #[test]
@@ -1134,6 +1144,29 @@ mod tests {
         assert_eq!(
             payload["messages"][0]["content"][1]["text"],
             json!("what is in this image?")
+        );
+    }
+
+    #[test]
+    fn request_translation_serializes_plain_text_user_messages_as_strings() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "glm-4.7".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage::user_text("reply with exactly: ready")],
+                system: Some("minimal system prompt".to_string()),
+                tools: None,
+                tool_choice: None,
+                stream: false,
+            },
+            OpenAiCompatConfig::openai(),
+        );
+
+        assert_eq!(payload["messages"][0]["role"], json!("system"));
+        assert_eq!(payload["messages"][1]["role"], json!("user"));
+        assert_eq!(
+            payload["messages"][1]["content"],
+            json!("reply with exactly: ready")
         );
     }
 
