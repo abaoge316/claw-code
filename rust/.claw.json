@@ -1,5 +1,5 @@
 {
-  "defaultModel": "glm-4.7",
+  "defaultModel": "MiniMax-M2.7",
   "models": [
     {
       "name": "glm-4.7",

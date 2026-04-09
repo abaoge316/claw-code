@@ -2603,8 +2603,8 @@ fn run_resume_command(
                 json: Some(handle_skills_slash_command_json(args.as_deref(), &cwd)?),
             })
         }
-        SlashCommand::PasteImage => Err(
-            "resumed /paste-image is interactive-only; start `claw` and run `/paste-image` in the REPL"
+        SlashCommand::PasteImage { .. } => Err(
+            "resumed /paste is interactive-only; start `claw` and run `/paste` in the REPL"
                 .into(),
         ),
         SlashCommand::Doctor => Ok(ResumeCommandOutcome {
@@ -3348,6 +3348,15 @@ impl LiveCli {
         Ok(())
     }
 
+    fn build_paste_turn_input(
+        image: ContentBlock,
+        text: Option<String>,
+    ) -> Option<UserTurnInput> {
+        text.filter(|value| !value.trim().is_empty()).map(|text| {
+            UserTurnInput::Blocks(vec![image, ContentBlock::Text { text }])
+        })
+    }
+
     fn prepare_turn_runtime(
         &self,
         emit_output: bool,
@@ -3547,9 +3556,13 @@ impl LiveCli {
                 false
             }
             SlashCommand::Model { model } => self.set_model(model)?,
-            SlashCommand::PasteImage => {
+            SlashCommand::PasteImage { text } => {
                 let image = read_clipboard_image_block()?;
-                self.queue_clipboard_image(image)?;
+                if let Some(turn_input) = Self::build_paste_turn_input(image.clone(), text) {
+                    self.run_turn_recoverable(turn_input);
+                } else {
+                    self.queue_clipboard_image(image)?;
+                }
                 false
             }
             SlashCommand::Permissions { mode } => self.set_permissions(mode)?,
@@ -7301,6 +7314,7 @@ mod tests {
     use runtime::{
         load_oauth_credentials, save_oauth_credentials, AssistantEvent, ConfigLoader, ContentBlock,
         ConversationMessage, MessageRole, OAuthConfig, PermissionMode, Session, ToolExecutor,
+        UserTurnInput,
     };
     use serde_json::json;
     use std::fs;
@@ -8487,6 +8501,29 @@ mod tests {
             .join("\n");
         assert!(prompt.contains("# Project context"));
         assert!(prompt.contains("# Runtime config"));
+    }
+
+    #[test]
+    fn paste_command_with_text_builds_immediate_turn_input() {
+        let image = ContentBlock::Image {
+            media_type: "image/png".to_string(),
+            data_base64: "iVBORw0KGgo=".to_string(),
+        };
+        let turn_input = LiveCli::build_paste_turn_input(
+            image.clone(),
+            Some("图里告诉我们什么".to_string()),
+        );
+
+        assert_eq!(
+            turn_input,
+            Some(UserTurnInput::Blocks(vec![
+                image.clone(),
+                ContentBlock::Text {
+                    text: "图里告诉我们什么".to_string(),
+                },
+            ]))
+        );
+        assert_eq!(LiveCli::build_paste_turn_input(image.clone(), None), None);
     }
 
     #[test]

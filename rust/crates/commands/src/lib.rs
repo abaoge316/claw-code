@@ -96,7 +96,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         name: "paste-image",
         aliases: &[],
         summary: "Paste an image from the clipboard into the next user message",
-        argument_hint: None,
+        argument_hint: Some("[text]"),
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -587,8 +587,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "paste",
         aliases: &[],
-        summary: "Paste clipboard content as input",
-        argument_hint: None,
+        summary: "Paste an image from the clipboard into the next user message",
+        argument_hint: Some("[text]"),
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -1081,7 +1081,9 @@ pub enum SlashCommand {
     Model {
         model: Option<String>,
     },
-    PasteImage,
+    PasteImage {
+        text: Option<String>,
+    },
     Permissions {
         mode: Option<String>,
     },
@@ -1281,10 +1283,7 @@ pub fn validate_slash_command_input(
         "model" => SlashCommand::Model {
             model: optional_single_arg(command, &args, "[model]")?,
         },
-        "paste-image" => {
-            validate_no_args(command, &args)?;
-            SlashCommand::PasteImage
-        }
+        "paste" | "paste-image" => SlashCommand::PasteImage { text: remainder },
         "permissions" => SlashCommand::Permissions {
             mode: parse_permissions_mode(&args)?,
         },
@@ -3894,7 +3893,7 @@ pub fn handle_slash_command(
         | SlashCommand::Sandbox
         | SlashCommand::Model { .. }
         | SlashCommand::Permissions { .. }
-        | SlashCommand::PasteImage
+        | SlashCommand::PasteImage { .. }
         | SlashCommand::Clear { .. }
         | SlashCommand::Cost
         | SlashCommand::Resume { .. }
@@ -4153,8 +4152,18 @@ mod tests {
             Ok(Some(SlashCommand::Model { model: None }))
         );
         assert_eq!(
+            SlashCommand::parse("/paste"),
+            Ok(Some(SlashCommand::PasteImage { text: None }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/paste 图里告诉我们什么"),
+            Ok(Some(SlashCommand::PasteImage {
+                text: Some("图里告诉我们什么".to_string())
+            }))
+        );
+        assert_eq!(
             SlashCommand::parse("/paste-image"),
-            Ok(Some(SlashCommand::PasteImage))
+            Ok(Some(SlashCommand::PasteImage { text: None }))
         );
         assert_eq!(
             SlashCommand::parse("/permissions read-only"),
